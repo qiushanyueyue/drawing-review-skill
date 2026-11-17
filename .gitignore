@@ -1,0 +1,6 @@
+review_pack*/
+**/mapping.local.json
+*.pdf
+__pycache__/
+.venv/
+.DS_Store
