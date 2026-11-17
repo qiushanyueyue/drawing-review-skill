@@ -67,6 +67,16 @@ def make_pdf(path: Path):
     c.showPage()
     c.setFont("STSong-Light", 10)
     c.drawString(40, 800, "图")
+    c.showPage()
+    # 第 3 页：以图形为主的配筋图，只有少量标注文字 + 同样的图签
+    c.setFont("STSong-Light", 8)
+    for x, y, t in ((200, 600, "KL1(2) 300×700"), (420, 600, "C35"), (200, 420, "顶板厚800"), (420, 420, "Φ25@150")):
+        c.drawString(x, y, t)
+    c.rect(180, 380, 400, 260)
+    c.setFont("STSong-Light", 7)
+    for i, (a, b) in enumerate(rows[:-2] + [("图名", "顶板配筋图"), ("图号", "JG-003")]):
+        c.drawString(960, 170 - i * 14, a)
+        c.drawString(1010, 170 - i * 14, b)
     c.save()
 
 
@@ -151,6 +161,8 @@ class PdfPipeline(unittest.TestCase):
         self.assertIn("顶板混凝土强度与抗渗等级前后不一致", report)
         self.assertIn("待查线索", report)
         self.assertIn("未审查 1 页（P2）", report)
+        self.assertIn("以图形为主 1 页（P3）", report)
+        self.assertIn("证据分级", report)
         self.assertNotIn("图签人员签字不全", report)
         for secret in [FAKE_COMPANY, FAKE_PROJECT, *FAKE_PEOPLE]:
             self.assertNotIn(secret, report)
@@ -177,10 +189,11 @@ class Helpers(unittest.TestCase):
         self.assertEqual(m.mask("示例站顶板厚800mm"), "［敏感词1］顶板厚800mm")
 
     def test_locate_rejects_short_or_missing(self):
-        blocks = [{"id": "P1-b1", "sheet": "P1", "text": "顶板厚度 800mm", "file": "x", "bbox": None}]
+        blocks = [{"id": "F1-P1-B1", "file_id": "F1", "sheet": "P1", "text": "顶板厚度 800mm", "file": "x", "bbox": None}]
         idx = {b["id"]: b for b in blocks}
-        self.assertEqual(dr.locate({"block": "P1-b1", "text": "800"}, blocks, idx)[0], [])
-        self.assertTrue(dr.locate({"block": "P1-b9", "text": "顶板厚度800mm"}, blocks, idx)[0])
+        self.assertEqual(dr.locate({"block": "F1-P1-B1", "text": "800"}, blocks, idx)[0], [])
+        hit, how, _ = dr.locate({"block": "F1-P1-B9", "text": "顶板厚度800mm"}, blocks, idx)
+        self.assertEqual(how, "relocated-same-page")
 
 
 class OverviewNotTitleBlock(unittest.TestCase):
@@ -202,6 +215,311 @@ class Garbled(unittest.TestCase):
         blocks = [dr.Block(f"P1-b{i}", "x", "P1", "本本本本本本本本本本C35本本本本P8本", [0, 0, 1, 1], "pdf-text") for i in range(3)]
         blocks.append(dr.Block("P2-b1", "x", "P2", "本工程主体结构顶板混凝土强度等级C35，抗渗等级P10，侧墙同顶板。", [0, 0, 1, 1], "pdf-text"))
         self.assertEqual(dr.garbled_sheets(blocks), {"P1"})
+
+
+def has_render():
+    try:
+        import pdfplumber, pypdfium2, PIL  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def blk(fid, page, j, text, bbox, h=10):
+    return {"id": f"{fid}-P{page}-B{j}", "file_id": fid, "file": f"图纸{fid[1:]}.pdf", "sheet": f"P{page}",
+            "text": text, "bbox": bbox, "height": h, "flags": []}
+
+
+def write_pack(tmp: Path, blocks: list[dict], pages=((1, 1),), size=(1190, 842)) -> Path:
+    """合成 review_pack：blocks.jsonl + coverage.json（不经过 PDF）。pages 为 (文件序号, 页码)。"""
+    pack = tmp / "pack"
+    pack.mkdir(parents=True, exist_ok=True)
+    with (pack / "blocks.jsonl").open("w", encoding="utf-8") as f:
+        for b in blocks:
+            f.write(json.dumps(b, ensure_ascii=False) + "\n")
+    files = {}
+    for fi, pg in pages:
+        files.setdefault(fi, []).append({"sheet": f"P{pg}", "page": f"F{fi}-P{pg}", "width": size[0], "height": size[1], "status": "ok"})
+    cov = {"tool": "test", "files": [{"file_id": f"F{fi}", "file": f"图纸{fi}.pdf", "format": "pdf", "sha256": "0" * 64, "status": "ok",
+                                      "sheets": sh} for fi, sh in files.items()],
+           "blocks_excluded_title_block_or_stamp": 0, "masked": {}, "scope_note": ""}
+    (pack / "coverage.json").write_text(json.dumps(cov, ensure_ascii=False), encoding="utf-8")
+    return pack
+
+
+def run_verify(pack: Path, findings: list[dict]) -> dict:
+    fp = pack / "findings.json"
+    fp.write_text(json.dumps({"findings": findings}, ensure_ascii=False), encoding="utf-8")
+    dr.main(["verify", "--pack", str(pack), "--findings", str(fp)])
+    return {f["id"]: f for f in json.loads((pack / "verified.json").read_text(encoding="utf-8"))["findings"]}
+
+
+class StrictLocate(unittest.TestCase):
+    """引文定位：只在所写块或其相邻、按顺序、空间连续的块中算定位成功。"""
+
+    def setUp(self):
+        self.blocks = [
+            blk("F1", 1, 1, "1.主体结构顶板混凝土强度等级C35，", [40, 100, 400, 110]),
+            blk("F1", 1, 2, "抗渗等级P10，侧墙同顶板。", [40, 116, 300, 126]),
+            blk("F1", 1, 3, "侧墙保护层厚度50mm。", [40, 600, 300, 610]),      # 远处，不连续
+            blk("F1", 1, 4, "施工应符合相关规范要求。", [40, 700, 300, 710]),
+            blk("F1", 1, 5, "施工应符合相关规范要求。", [40, 716, 300, 726]),  # 同页重复文字
+            blk("F2", 1, 1, "底板混凝土强度等级C40。", [40, 100, 300, 110]),
+        ]
+        self.idx = {b["id"]: b for b in self.blocks}
+
+    def loc(self, block, text):
+        return dr.locate({"block": block, "text": text}, self.blocks, self.idx)
+
+    def test_exact_and_ordered_multi_block(self):
+        self.assertEqual(self.loc("F1-P1-B1", "顶板混凝土强度等级C35")[1], "exact")
+        hit, how, _ = self.loc("F1-P1-B1", "强度等级C35，抗渗等级P10")
+        self.assertEqual(how, "exact-multi")
+        self.assertEqual([b["id"] for b in hit], ["F1-P1-B1", "F1-P1-B2"])
+
+    def test_reversed_or_distant_fragments_rejected(self):
+        self.assertEqual(self.loc("F1-P1-B2", "抗渗等级P10，侧墙同顶板。1.主体结构")[0], [])
+        self.assertEqual(self.loc("F1-P1-B2", "侧墙同顶板。侧墙保护层厚度50mm")[0], [])
+
+    def test_two_column_flow(self):
+        blocks = [blk("F1", 1, 1, "1.顶板混凝土强度等级C35，", [40, 100, 300, 110]),
+                  blk("F1", 1, 2, "5.施工缝设置钢板止水带，", [600, 100, 860, 110]),
+                  blk("F1", 1, 3, "抗渗等级P10。", [40, 116, 200, 126]),
+                  blk("F1", 1, 4, "钢板厚度3mm。", [600, 116, 760, 126])]
+        idx = {b["id"]: b for b in blocks}
+        hit, how, _ = dr.locate({"block": "F1-P1-B1", "text": "强度等级C35，抗渗等级P10"}, blocks, idx)
+        self.assertEqual((how, [b["id"] for b in hit]), ("exact-multi", ["F1-P1-B1", "F1-P1-B3"]))
+        hit, how, _ = dr.locate({"block": "F1-P1-B4", "text": "钢板止水带，钢板厚度3mm"}, blocks, idx)
+        self.assertEqual((how, [b["id"] for b in hit]), ("exact-multi", ["F1-P1-B2", "F1-P1-B4"]))
+
+    def test_distant_labels_on_same_line_split(self):
+        def w(t, x0, x1, top=100):
+            return {"text": t, "x0": x0, "x1": x1, "top": top, "bottom": top + 8}
+        lines = dr.group_lines([w("KL1(2)", 200, 226), w("300×700", 230, 262), w("C35", 420, 434), w("顶板厚800", 200, 240, 300)])
+        self.assertEqual([ln["text"] for ln in lines], ["KL1(2) 300×700", "C35", "顶板厚800"])
+
+    def test_ambiguous_same_page(self):
+        hit, how, cands = self.loc("F1-P1-B9", "施工应符合相关规范要求")
+        self.assertEqual((hit, how), ([], "ambiguous-same-page"))
+        self.assertEqual(len(cands), 2)
+
+    def test_other_file_is_only_candidate(self):
+        hit, how, cands = self.loc("F1-P1-B1", "底板混凝土强度等级C40")
+        self.assertEqual((hit, how), ([], "relocated_candidate"))
+        self.assertEqual([b["id"] for b in cands], ["F2-P1-B1"])
+
+
+class VerifyEvidence(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        blocks = [
+            blk("F1", 1, 1, "顶板混凝土强度等级C35，抗渗等级P10。", [40, 100, 400, 110]),
+            blk("F1", 1, 2, "KL1(2) 300×700", [500, 300, 560, 308], h=8),
+            blk("F1", 1, 3, "Φ25@150", [500, 312, 540, 320], h=8),
+            blk("F1", 2, 1, "顶板混凝土强度等级C40，抗渗等级P8。", [40, 100, 400, 110]),
+            blk("F2", 1, 1, "顶板实配钢筋面积As=3272mm²/m", [40, 100, 400, 110]),
+        ]
+        self.pack = write_pack(self.tmp, blocks, pages=((1, 1), (1, 2), (2, 1)))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def finding(self, fid, **kw):
+        base = {"id": fid, "rule": "C8", "title": f"测试{fid}", "problem": "x", "decision": "suspected", "confidence": 0.9}
+        base.update(kw)
+        return base
+
+    def test_cross_page_needs_explicit_object_match(self):
+        q = [{"block": "F1-P1-B1", "text": "顶板混凝土强度等级C35"}, {"block": "F1-P2-B1", "text": "顶板混凝土强度等级C40"}]
+        res = run_verify(self.pack, [self.finding("A", quotes=q)])
+        self.assertEqual(res["A"]["decision"], "needs_context")
+        self.assertIn("对象对应关系未确认", "".join(res["A"]["missing"]))
+        res = run_verify(self.pack, [self.finding("B", quotes=q, object_match="explicit")])
+        self.assertEqual(res["B"]["decision"], "suspected")
+        self.assertEqual(res["B"]["evidence"]["E2"], "explicit")
+
+    def test_quote_in_wrong_file_becomes_lead(self):
+        res = run_verify(self.pack, [self.finding("A", quotes=[{"block": "F1-P1-B1", "text": "顶板实配钢筋面积As=3272"}])])
+        self.assertEqual(res["A"]["decision"], "lead")
+        self.assertEqual(res["A"]["quotes"][0]["how"], "relocated_candidate")
+        self.assertEqual(res["A"]["evidence"]["E1"], "fail")
+
+    def test_calc_mismatch_confirms_and_match_refutes(self):
+        q = [{"block": "F2-P1-B1", "text": "顶板实配钢筋面积As=3272mm²/m"}]
+        res = run_verify(self.pack, [
+            self.finding("A", rule="C14", check_method="calc", quotes=q, calculation=[{"expr": "As_s(25,150)", "stated": 3000, "unit": "mm2/m"}]),
+            self.finding("B", rule="C14", title="另一复算", check_method="calc", confidence=0.8, quotes=[{"block": "F1-P1-B2", "text": "KL1(2) 300×700"}],
+                         calculation=[{"expr": "As_s(25,150)", "stated": 3272, "unit": "mm2/m"}]),
+        ])
+        self.assertEqual(res["A"]["decision"], "suspected")
+        self.assertEqual(res["A"]["evidence"]["E3"], "calc_mismatch_confirmed")
+        self.assertEqual(res["B"]["decision"], "lead")
+        self.assertEqual(res["B"]["calculation"][0]["status"], "match")
+
+    def test_visual_evidence(self):
+        res = run_verify(self.pack, [
+            self.finding("A", check_method="vision", object_match="explicit", quotes=[{"block": "F1-P1-B3", "text": "Φ25@150"}],
+                         visual_evidence=[{"page": "F1-P1", "bbox": [490, 290, 580, 330], "reads": "Φ25@150"}]),
+            self.finding("B", title="仅视觉", check_method="vision", visual_evidence=[{"page": "F1-P1", "bbox": [600, 600, 700, 700], "reads": "Φ28@100"}]),
+            self.finding("C", title="框不覆盖引文", check_method="vision", object_match="explicit", confidence=0.85,
+                         quotes=[{"block": "F1-P1-B1", "text": "顶板混凝土强度等级C35"}],
+                         visual_evidence=[{"page": "F1-P1", "bbox": [490, 290, 580, 330], "reads": "KL1"}]),
+            self.finding("D", title="坐标越界", check_method="vision", visual_evidence=[{"page": "F1-P1", "bbox": [0, 0, 5000, 10]}]),
+        ])
+        self.assertEqual(res["A"]["decision"], "suspected")
+        self.assertEqual(res["A"]["visual_evidence"][0]["status"], "corroborated")
+        self.assertTrue(res["A"]["evidence"]["spatial_support"])
+        self.assertEqual(res["B"]["decision"], "needs_context")
+        self.assertEqual(res["B"]["evidence"]["E1"], "vision_only")
+        self.assertEqual(res["C"]["decision"], "needs_context")
+        self.assertEqual(res["D"]["decision"], "lead")
+
+    def test_near(self):
+        blocks = dr.load_blocks(self.pack)
+        res = dr.near_blocks(blocks, block="F1-P1-B2")
+        self.assertEqual(res[0]["id"], "F1-P1-B3")
+        self.assertEqual(res[0]["dir"], "下")
+        self.assertNotIn("F1-P2-B1", [r["id"] for r in res])
+        inside = dr.near_blocks(blocks, page="F1-P1", region=[480, 280, 600, 340])
+        self.assertEqual([r["id"] for r in inside], ["F1-P1-B2", "F1-P1-B3"])
+
+
+class Calc(unittest.TestCase):
+    def test_values(self):
+        sys.path.insert(0, str(ROOT / "drawing-review" / "scripts"))
+        import dr_calc
+        self.assertAlmostEqual(dr_calc.evaluate("As(25,6)"), 2945.24, places=1)
+        self.assertAlmostEqual(dr_calc.evaluate("As_s(25, 150)"), 3272.49, places=1)
+        self.assertAlmostEqual(dr_calc.evaluate("1.3×120+1.5×80"), 276.0)
+        self.assertAlmostEqual(dr_calc.evaluate("rho(3272, 1000, 750)"), 0.0043627, places=6)
+        for bad in ("__import__('os').system('echo')", "open('x')", "9**9**9", "1/0", "x+1", "(1).real"):
+            with self.assertRaises(ValueError, msg=bad):
+                dr_calc.evaluate(bad)
+
+
+class TitleBlockWarnings(unittest.TestCase):
+    def test_body_like_text_inside_title_block_flagged(self):
+        rows = [("设计", "甲"), ("校对", "乙"), ("审核", "丙"), ("图号", "JG-01")]
+        blocks = []
+        for i, (a, b) in enumerate(rows):
+            blocks.append(dr.Block(f"F1-P1-B{2 * i + 1}", "x", "P1", a, [900, 700 + i * 12, 920, 708 + i * 12], "pdf-text", height=8, file_id="F1"))
+            blocks.append(dr.Block(f"F1-P1-B{2 * i + 2}", "x", "P1", b, [940, 700 + i * 12, 980, 708 + i * 12], "pdf-text", height=8, file_id="F1"))
+        for k in range(3):
+            blocks.append(dr.Block(f"F1-P1-B{20 + k}", "x", "P1", f"{k + 1}.顶板混凝土强度等级C35，施工缝处应设置止水钢板。",
+                                   [860, 690 + k * 10, 1000, 698 + k * 10], "pdf-text", height=8, file_id="F1"))
+        meta = dr.mark_title_blocks(blocks)["P1"]
+        self.assertEqual(meta["title_block_regions"], 1)
+        self.assertGreaterEqual(meta["title_block_body_like"], 3)
+
+
+@unittest.skipIf(rl_canvas is None or not has_render(), "图像模式需要 reportlab + pdfplumber（pypdfium2、Pillow）")
+class ImageMode(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        cls.pdf = cls.tmp / "a.pdf"
+        make_pdf(cls.pdf)
+        cls.pack = cls.tmp / "pack"
+        dr.main(["extract", str(cls.pdf), "--out", str(cls.pack)])
+        dr.main(["render", str(cls.pdf), "--pack", str(cls.pack)])
+        cls.man = json.loads((cls.pack / "images.json").read_text(encoding="utf-8"))
+        cls.red = json.loads((cls.pack / "redactions.json").read_text(encoding="utf-8"))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def open(self, rel):
+        from PIL import Image
+        return Image.open(self.pack / rel).convert("RGB")
+
+    def test_pages_rendered_scanned_skipped(self):
+        pages = sorted(im["page"] for im in self.man["images"] if im["kind"] == "page")
+        self.assertEqual(pages, ["F1-P1", "F1-P3"])
+
+    def test_title_block_and_masked_text_painted_black(self):
+        im = next(i for i in self.man["images"] if i["page"] == "F1-P1")
+        img = self.open(im["path"])
+        s = im["px_per_pt"]
+        boxes = [r for r in self.red["F1-P1"] if r["why"] in ("title_block_text", "masked_text", "stamp_text")]
+        self.assertTrue(boxes)
+        for r in boxes:
+            x0, y0, x1, y1 = r["bbox"]
+            for fx, fy in ((0.25, 0.5), (0.5, 0.5), (0.75, 0.5)):
+                px = img.getpixel((int((x0 + (x1 - x0) * fx) * s), int((y0 + (y1 - y0) * fy) * s)))
+                self.assertEqual(px, (0, 0, 0), r)
+        body = dr.load_blocks(self.pack)
+        b = next(b for b in body if "顶板混凝土强度等级C40" in b["text"])
+        crop = img.crop([int(v * s) for v in b["bbox"]])
+        self.assertGreater(len(crop.getcolors(maxcolors=1 << 20) or []), 2)   # 正文保留可读，没有被涂黑
+
+    def test_zoom_and_wrong_file(self):
+        dr.main(["zoom", str(self.pdf), "--pack", str(self.pack), "--page", "F1-P3", "--region", "150,180,620,480", "--dpi", "300"])
+        man = json.loads((self.pack / "images.json").read_text(encoding="utf-8"))
+        z = next(i for i in man["images"] if i["kind"] == "zoom")
+        img = self.open(z["path"])
+        self.assertLessEqual(max(img.size), 2400)
+        self.assertAlmostEqual(img.size[0] / img.size[1], 470 / 300, delta=0.05)
+        other = self.tmp / "other.pdf"
+        rl = rl_canvas.Canvas(str(other))
+        rl.drawString(10, 10, "x")
+        rl.save()
+        with self.assertRaises(SystemExit):
+            dr.main(["render", str(other), "--pack", str(self.pack)])
+
+    def test_evidence_crop(self):
+        blocks = dr.load_blocks(self.pack)
+        b = next(b for b in blocks if "Φ25@150" in b["text"])
+        fp = self.pack / "findings.json"
+        fp.write_text(json.dumps({"findings": [{"id": "F9", "rule": "C11", "title": "配筋标注待核", "problem": "x", "decision": "needs_context",
+                                                "confidence": 0.7, "quotes": [{"block": b["id"], "text": "Φ25@150"}]}]}, ensure_ascii=False), encoding="utf-8")
+        dr.main(["verify", "--pack", str(self.pack), "--findings", str(fp)])
+        dr.main(["evidence", str(self.pdf), "--pack", str(self.pack)])
+        self.assertTrue((self.pack / "evidence" / "F9.png").exists())
+        dr.main(["report", "--pack", str(self.pack)])
+        self.assertIn("evidence/F9.png", (self.pack / "审查报告.md").read_text(encoding="utf-8"))
+
+
+@unittest.skipIf(rl_canvas is None or not has_render(), "需要 reportlab + pdfplumber")
+class RotatedPageAlignment(unittest.TestCase):
+    def test_mask_covers_text_on_rotated_pages(self):
+        from pypdf import PdfReader, PdfWriter
+        from PIL import ImageDraw
+        import pypdfium2 as pdfium
+        sys.path.insert(0, str(ROOT / "drawing-review" / "scripts"))
+        import dr_render
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            base = tmp / "base.pdf"
+            c = rl_canvas.Canvas(str(base), pagesize=(600, 400))
+            c.setFont("STSong-Light", 20)
+            c.drawString(400, 300, "MARK标记")
+            c.save()
+            for rot in (0, 90, 270):
+                r = PdfReader(str(base))
+                w = PdfWriter()
+                pg = r.pages[0]
+                pg.rotate(rot)
+                w.add_page(pg)
+                path = tmp / f"r{rot}.pdf"
+                w.write(str(path))
+                blocks, info = dr.extract_pdf(path, "x.pdf", "F1")
+                box = [blocks[0].bbox]
+                doc = pdfium.PdfDocument(str(path))
+                img = dr_render._render(doc, info[0], 2.0)
+                self.assertIsNotNone(img, rot)
+                dark = img.convert("L").point(lambda v: 255 if v < 128 else 0)
+                self.assertIsNotNone(dark.getbbox(), rot)
+                dr_render._paint(img, box, 2.0, (0, 0), ImageDraw)
+                gray = img.convert("L")
+                # 涂黑后，框外不应还有文字的深色像素
+                outside = gray.point(lambda v: 255 if v < 128 else 0)
+                x0, y0, x1, y1 = [int(v * 2) for v in box[0]]
+                outside.paste(0, (max(0, x0 - 4), max(0, y0 - 4), x1 + 4, y1 + 4))
+                self.assertIsNone(outside.getbbox(), rot)
+                doc.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
